@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Camera, AlertTriangle, Settings, Power, Volume2, VolumeX, Info } from 'lucide-react';
 import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+import * as tf from '@tensorflow/tfjs';
 import '../App.css';
 
 // Eye Aspect Ratio Calculator
@@ -49,6 +50,7 @@ const DrowsinessDetector = () => {
   const closedFrameCountRef = useRef(0);
   const oscillatorRef = useRef(null);
   const gainNodeRef = useRef(null);
+  const modelRef = useRef(null);
   
   const CONSEC_FRAMES = 45;
   
@@ -83,6 +85,8 @@ const DrowsinessDetector = () => {
         minTrackingConfidence: 0.5
       });
       
+      await loadCNNModel();
+      
       setIsLoading(false);
       return true;
     } catch (err) {
@@ -91,6 +95,53 @@ const DrowsinessDetector = () => {
       setIsLoading(false);
       return false;
     }
+  };
+
+  const loadCNNModel = async () => {
+    try {
+      modelRef.current = await tf.loadLayersModel('/model/model.json');
+      console.log("CNN model loaded successfully");
+    } catch (err) {
+      console.error("Failed to load CNN model:", err);
+      setError("Failed to load eye classification model. Using EAR fallback.");
+    }
+  };
+
+  const cropEye = (ctx, eyeLandmarks, canvasWidth, canvasHeight) => {
+    const xs = eyeLandmarks.map(p => p.x * canvasWidth);
+    const ys = eyeLandmarks.map(p => p.y * canvasHeight);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    const width = maxX - minX;
+    const height = maxY - minY;
+    const padding = 0.1;
+    const paddedMinX = Math.max(0, minX - width * padding);
+    const paddedMaxX = Math.min(canvasWidth, maxX + width * padding);
+    const paddedMinY = Math.max(0, minY - height * padding);
+    const paddedMaxY = Math.min(canvasHeight, maxY + height * padding);
+    const eyeImageData = ctx.getImageData(paddedMinX, paddedMinY, paddedMaxX - paddedMinX, paddedMaxY - paddedMinY);
+    return eyeImageData;
+  };
+
+  const preprocessEye = (imageData) => {
+    return tf.tidy(() => {
+      let tensor = tf.browser.fromPixels(imageData);
+      tensor = tf.image.resizeBilinear(tensor, [24, 24]);
+      tensor = tf.mean(tensor, -1, true);
+      tensor = tf.div(tensor, 255.0);
+      tensor = tf.expandDims(tensor, 0);
+      return tensor;
+    });
+  };
+
+  const classifyEye = async (preprocessed) => {
+    if (!modelRef.current) return null;
+    const prediction = modelRef.current.predict(preprocessed);
+    const result = await prediction.data();
+    prediction.dispose();
+    return result[0] > 0.5; // assuming result[0] is prob closed
   };
 
   const startCamera = async () => {
@@ -273,7 +324,22 @@ const DrowsinessDetector = () => {
             drawEyeContour(ctx, leftEye, canvas.width, canvas.height);
             drawEyeContour(ctx, rightEye, canvas.width, canvas.height);
             
-            if (ear < threshold) {
+            let bothEyesClosed = false;
+            if (modelRef.current) {
+              const leftEyeImage = cropEye(ctx, leftEye, canvas.width, canvas.height);
+              const rightEyeImage = cropEye(ctx, rightEye, canvas.width, canvas.height);
+              const leftPreprocessed = preprocessEye(leftEyeImage);
+              const rightPreprocessed = preprocessEye(rightEyeImage);
+              const leftClosed = await classifyEye(leftPreprocessed);
+              const rightClosed = await classifyEye(rightPreprocessed);
+              leftPreprocessed.dispose();
+              rightPreprocessed.dispose();
+              bothEyesClosed = leftClosed && rightClosed;
+            } else {
+              bothEyesClosed = ear < threshold;
+            }
+            
+            if (bothEyesClosed) {
               closedFrameCountRef.current++;
               setClosedFrames(closedFrameCountRef.current);
               
@@ -367,6 +433,9 @@ const DrowsinessDetector = () => {
       }
       if (gainNode) {
         gainNode.disconnect();
+      }
+      if (modelRef.current) {
+        modelRef.current.dispose();
       }
     };
   }, []);
